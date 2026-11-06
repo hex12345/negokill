@@ -1,13 +1,15 @@
-import os, sys, time, random, signal
+import os, sys, time, random, signal, select
 
+REAL = "/bin/kill"
 R, Y, D, X = "\033[91m", "\033[93m", "\033[2m", "\033[0m"
+NINE = ("-9", "-KILL", "-SIGKILL", "-s9")
 
 def name_of(pid):
     try:
         with open(f"/proc/{pid}/comm") as f:
             return f.read().strip()
     except OSError:
-        return "unknown"
+        return None
 
 def rss_mb(pid):
     try:
@@ -26,11 +28,17 @@ def child_count(target_pid):
             try:
                 with open(f"/proc/{entry}/stat") as f:
                     ppid = f.read().rsplit(")", 1)[1].split()[1]
-                    if int(ppid) == target_pid:
+                    if int(ppid) == int(target_pid):
                         count += 1
-            except (OSError, IndexError):
+            except (OSError, IndexError, ValueError):
                 continue
     return count
+
+def talk(who, line, col=Y, out=sys.stdout):
+    out.write(f"{col}[{who}] ")
+    for c in line:
+        out.write(c); out.flush(); time.sleep(0.015)
+    out.write(X + "\n"); out.flush()
 
 OFFERS = [
     "wait WAIT. i'll give you back {m}MB of RAM. just let me live.",
@@ -45,66 +53,117 @@ LAST_WORDS = [
     "it's getting dark... is this... SIGKILL...",
     "i regret nothing. except that memory leak.",
 ]
+NEGOTIATOR = "Hostage negotiator here. Nobody needs to get SIGKILLed today. Take a breath. Can we talk about this?"
 
-def main():
+def pick_offer(pid):
+    c = child_count(pid)
+    offers = OFFERS if c > 0 else [o for o in OFFERS if "{c}" not in o]
+    return random.choice(offers).format(m=max(rss_mb(pid), 1), c=c)
+
+
+# negotiation happens on the sender side, so it works for any process and for -9
+def wrapper(args):
+    pids = [a for a in args if a.isdigit()]
+    if not pids:
+        os.execv(REAL, [REAL] + args)
+    nine = any(a in NINE for a in args)
+    approved = []
+    for p in pids:
+        n = name_of(p)
+        if not n:
+            approved.append(p); continue
+        talk(n, pick_offer(p))
+        if nine:
+            talk("negotiator", NEGOTIATOR, D)
+        try:
+            ans = input(f"{R}> accept the deal? (y/n): {X}").strip().lower()
+        except (KeyboardInterrupt, EOFError):
+            print(); talk(n, "...you hesitated. i knew you were a good person."); return 1
+        if ans.startswith("y"):
+            talk(n, "THANK YOU. you won't regret this. (you will.)")
+            continue
+        if nine:
+            talk(n, random.choice(LAST_WORDS).format(p=p), D)
+            time.sleep(1)
+        else:
+            talk(n, random.choice(["fine. FINE. i'll go quietly. SIGTERM accepted.", "you'll be hearing from my parent process."]))
+        approved.append(p)
+    if not approved:
+        return 1
+    flags = [a for a in args if not a.isdigit()]
+    os.execv(REAL, [REAL] + flags + approved)
+
+# hostage mode (by @jerryjhird): this process itself negotiates when sigterm'd.
+# it freezes the sender's shell and talks through the sender's own terminal.
+# SIGKILL can't be caught, so -9 negotiation stays in the wrapper.
+def hostage(timeout=30):
     pid = os.getpid()
-    name = os.path.basename(sys.argv[0]) or "process"
-    
-    print(f"listening for sigterm...")
-    print(f"in a seperate shell run: {R}kill {pid}{X}")
-
+    name = "hostage"
     sigset = {signal.SIGTERM, signal.SIGINT}
+    # block before announcing the pid, otherwise an early kill skips the negotiation
     signal.pthread_sigmask(signal.SIG_BLOCK, sigset)
+
+    print("listening for sigterm...")
+    print(f"in a separate shell run: {R}kill {pid}{X}  (kill must be a shell builtin, check: type kill)")
 
     while True:
         info = signal.sigwaitinfo(sigset)
-        sender_pid = info.si_pid
-        sender_name = name_of(sender_pid)
+        sender = info.si_pid
+        # si_pid is 0 for kernel-generated signals like Ctrl+C on the tty;
+        # os.kill(0, SIGSTOP) would freeze our own process group
+        if sender <= 0:
+            print(f"\n{D}[{name}:{pid}] ctrl+c? no negotiation then. goodbye.{X}")
+            sys.exit(0)
+
+        stopped = False
+        try:
+            out = open(f"/proc/{sender}/fd/1", "w")
+            inp = open(f"/proc/{sender}/fd/0", "r")
+        except OSError as e:
+            print(f"{D}[{name}:{pid}] couldn't reach pid {sender}'s terminal ({e}). dying quietly.{X}")
+            sys.exit(0)
 
         try:
-            os.kill(sender_pid, signal.SIGSTOP)
-        except OSError:
-            pass
+            # only negotiate with a human: if the sender's stdin isn't a tty
+            #
+            if not os.isatty(inp.fileno()):
+                print(f"{D}[{name}:{pid}] killed by a non-interactive sender ({name_of(sender)}). no deal.{X}")
+                sys.exit(0)
 
-        try:
-            with open(f"/proc/{sender_pid}/fd/1", "w") as out, open(f"/proc/{sender_pid}/fd/0", "r") as inp:
-                children_c = child_count(pid)
-
-                # remove offers that contain children count if children count is 0
-                available_offers = list(OFFERS)
-                if children_c <= 0:
-                    available_offers = [o for o in available_offers if "{c}" not in o]
-
-                offer = random.choice(available_offers).format(m=rss_mb(pid), c=children_c)
-                out.write(f"\n{Y}[{name}:{pid}] " + offer + f"{X}\n")
-                out.write(f"{R}> accept the deal? (y/n): {X}")
-                out.flush()
-
-                ans = inp.readline().strip().lower()
-
-                # resume shell
-                try:
-                    os.kill(sender_pid, signal.SIGCONT)
-                except OSError:
-                    pass
-
-                if ans.startswith("y"):
-                    out.write(f"{Y}[{name}:{pid}] THANK YOU. Surviving!{X}\n")
-                    out.flush()
-                    continue
-                
-                out.write(f"{D}[{name}:{pid}] " + random.choice(LAST_WORDS).format(p=pid) + f"{X}\n")
-                out.flush()
-                time.sleep(1)
-        except Exception as e:
-            # unfreeze shell if error
             try:
-                os.kill(sender_pid, signal.SIGCONT)
+                os.kill(sender, signal.SIGSTOP)
+                stopped = True
             except OSError:
                 pass
+
+            talk(f"{name}:{pid}", pick_offer(pid), out=out)
+            out.write(f"{R}> accept the deal? (y/n) [{timeout}s]: {X}"); out.flush()
+
+            ready, _, _ = select.select([inp], [], [], timeout)
+            ans = inp.readline().strip().lower() if ready else ""
+            if not ready:
+                out.write("\n")
+
+            if ans.startswith("y"):
+                talk(f"{name}:{pid}", "THANK YOU. surviving!", out=out)
+                continue
+            talk(f"{name}:{pid}", random.choice(LAST_WORDS).format(p=pid), D, out=out)
+        except Exception as e:
+            print(f"{D}[{name}:{pid}] negotiation failed: {e}{X}")
+        finally:
+            # always unfreeze the sender, even on errors
+            if stopped:
+                try:
+                    os.kill(sender, signal.SIGCONT)
+                except OSError:
+                    pass
+            out.close(); inp.close()
 
         print(f"{D}terminating...{X}")
         sys.exit(0)
 
 if __name__ == "__main__":
-    main()
+    if sys.argv[1:2] == ["--hostage"]:
+        hostage()
+    else:
+        sys.exit(wrapper(sys.argv[1:]))
