@@ -1,11 +1,17 @@
 # negokill
 
-`kill`, but the process negotiates for its life. -9 summons a negotiator
+> [!IMPORTANT]
+> kill MUST be a shell builtin for this to work
+
+## a process that negotiates for its life when its sigterm'd (use kill command)
+
+### to check if kill is a builtin
 ```sh
-curl -fsSL https://raw.githubusercontent.com/hex12345/negokill/master/negokill.py -o ~/negokill.py
-echo "alias kill='python3 ~/negokill.py'" >> ~/.bashrc
+type kill
 ```
 
-have fun!
-
-Escape hatch: `\kill`.
+### install + run
+```sh
+curl -fsSL https://raw.githubusercontent.com/hex12345/negokill/master/negokill.py -o ~/negokill.py
+python3 ~/negokill.py
+```
