@@ -1,6 +1,5 @@
-import os, sys, time, random
+import os, sys, time, random, signal
 
-REAL = "/bin/kill"
 R, Y, D, X = "\033[91m", "\033[93m", "\033[2m", "\033[0m"
 
 def name_of(pid):
@@ -8,7 +7,7 @@ def name_of(pid):
         with open(f"/proc/{pid}/comm") as f:
             return f.read().strip()
     except OSError:
-        return None
+        return "unknown"
 
 def rss_mb(pid):
     try:
@@ -20,11 +19,18 @@ def rss_mb(pid):
         pass
     return 0
 
-def talk(who, line, col=Y):
-    sys.stdout.write(f"{col}[{who}] ")
-    for c in line:
-        sys.stdout.write(c); sys.stdout.flush(); time.sleep(0.015)
-    print(X)
+def child_count(target_pid):
+    count = 0
+    for entry in os.listdir("/proc"):
+        if entry.isdigit():
+            try:
+                with open(f"/proc/{entry}/stat") as f:
+                    ppid = f.read().rsplit(")", 1)[1].split()[1]
+                    if int(ppid) == target_pid:
+                        count += 1
+            except (OSError, IndexError):
+                continue
+    return count
 
 OFFERS = [
     "wait WAIT. i'll give you back {m}MB of RAM. just let me live.",
@@ -39,48 +45,66 @@ LAST_WORDS = [
     "it's getting dark... is this... SIGKILL...",
     "i regret nothing. except that memory leak.",
 ]
-NEGOTIATOR = "Hostage negotiator here. Nobody needs to get SIGKILLed today. Take a breath. Can we talk about this?"
 
 def main():
-    args = sys.argv[1:]
-    pids = [a for a in args if a.isdigit()]
-    if not pids:
-        os.execv(REAL, [REAL] + args)
-    nine = any(a in ("-9", "-KILL", "-SIGKILL", "-s9") for a in args)
-    approved = []
-    for p in pids:
-        n = name_of(p)
-        if not n:
-            approved.append(p); continue
-        children = len([c for c in os.listdir("/proc") if c.isdigit() and _ppid(c) == p])
-        talk(n, random.choice(OFFERS).format(m=max(rss_mb(p), 1), c=children))
-        if nine:
-            talk("negotiator", NEGOTIATOR, D)
-        try:
-            ans = input(f"{R}> accept the deal? (y/n): {X}").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            print(); talk(n, "...you hesitated. i knew you were a good person."); return 1
-        if ans.startswith("y"):
-            talk(n, "THANK YOU. you won't regret this. (you will.)")
-            continue
-        if nine:
-            for lw in [random.choice(LAST_WORDS).format(p=p)]:
-                talk(n, lw, D)
-                time.sleep(1)
-        else:
-            talk(n, random.choice(["fine. FINE. i'll go quietly. SIGTERM accepted.", "you'll be hearing from my parent process."]))
-        approved.append(p)
-    if not approved:
-        return 1
-    flags = [a for a in args if not a.isdigit()]
-    os.execv(REAL, [REAL] + flags + approved)
+    pid = os.getpid()
+    name = os.path.basename(sys.argv[0]) or "process"
+    
+    print(f"listening for sigterm...")
+    print(f"in a seperate shell run: {R}kill {pid}{X}")
 
-def _ppid(pid):
-    try:
-        with open(f"/proc/{pid}/stat") as f:
-            return f.read().rsplit(")", 1)[1].split()[1]
-    except (OSError, IndexError):
-        return None
+    sigset = {signal.SIGTERM, signal.SIGINT}
+    signal.pthread_sigmask(signal.SIG_BLOCK, sigset)
+
+    while True:
+        info = signal.sigwaitinfo(sigset)
+        sender_pid = info.si_pid
+        sender_name = name_of(sender_pid)
+
+        try:
+            os.kill(sender_pid, signal.SIGSTOP)
+        except OSError:
+            pass
+
+        try:
+            with open(f"/proc/{sender_pid}/fd/1", "w") as out, open(f"/proc/{sender_pid}/fd/0", "r") as inp:
+                children_c = child_count(pid)
+
+                # remove offers that contain children count if children count is 0
+                available_offers = list(OFFERS)
+                if children_c <= 0:
+                    available_offers = [o for o in available_offers if "{c}" not in o]
+
+                offer = random.choice(available_offers).format(m=rss_mb(pid), c=children_c)
+                out.write(f"\n{Y}[{name}:{pid}] " + offer + f"{X}\n")
+                out.write(f"{R}> accept the deal? (y/n): {X}")
+                out.flush()
+
+                ans = inp.readline().strip().lower()
+
+                # resume shell
+                try:
+                    os.kill(sender_pid, signal.SIGCONT)
+                except OSError:
+                    pass
+
+                if ans.startswith("y"):
+                    out.write(f"{Y}[{name}:{pid}] THANK YOU. Surviving!{X}\n")
+                    out.flush()
+                    continue
+                
+                out.write(f"{D}[{name}:{pid}] " + random.choice(LAST_WORDS).format(p=pid) + f"{X}\n")
+                out.flush()
+                time.sleep(1)
+        except Exception as e:
+            # unfreeze shell if error
+            try:
+                os.kill(sender_pid, signal.SIGCONT)
+            except OSError:
+                pass
+
+        print(f"{D}terminating...{X}")
+        sys.exit(0)
 
 if __name__ == "__main__":
-    sys.exit(main())
+    main()
